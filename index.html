@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="robots" content="noindex, nofollow" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sardine CPQ</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="config.js"></script>
+<style>html,body{margin:0;height:100%;}#root{min-height:100%;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState } = React;
+
+/* ============================================================================
+   CONFIG — the pricing model + approval policy live in config.js (loaded before
+   this script). Edit numbers there, never here. Config not code.
+   ========================================================================== */
+const { USAGE_PRODUCTS, IMPLEMENTATION_TIERS, APPROVAL_BANDS, DEFAULT_PRODUCTS } = window.SARDINE_CPQ_CONFIG;
+const CATALOG = Object.fromEntries(USAGE_PRODUCTS.map((p) => [p.key, p]));
+
+const RUNTIME_MODEL = "claude-haiku-4-5-20251001";
+
+/* ============================================================================
+   DETERMINISTIC PRICING CORE  (no AI — pure, reproducible, auditable)
+   ========================================================================== */
+
+// Graduated tier pricing: a monthly volume, charged bracket by bracket.
+// Returns monthly cost plus per-bracket breakdown for the (i) tier tooltip.
+function gradedCost(monthlyVol, tiers) {
+  let cost = 0, lower = 0, remaining = monthlyVol;
+  const breakdown = [];
+  for (const t of tiers) {
+    if (remaining <= 0) break;
+    const span = t.upTo - lower;             // width of this bracket
+    const units = Math.min(remaining, span);
+    if (units > 0) {
+      const amt = units * t.rate;
+      cost += amt;
+      breakdown.push({ from: lower, to: t.upTo, units, rate: t.rate, amt });
+    }
+    remaining -= units;
+    lower = t.upTo;
+  }
+  return { cost, breakdown };
+}
+
+function toMonthly(vol, basis) { return basis === "annual" ? vol / 12 : vol; }
+function frac(x) { return Math.max(0, Math.min(1, (Number(x) || 0) / 100)); }
+function implTier(annualUsage) {
+  return IMPLEMENTATION_TIERS.find((t) => annualUsage <= t.upTo) || IMPLEMENTATION_TIERS[IMPLEMENTATION_TIERS.length - 1];
+}
+
+// The whole quote. A product is included if it has a volume. Each line carries
+// its own manual discount; implementation is auto (band off PRE-discount usage)
+// and also discountable. Routing keys off the BLENDED discount across all lines.
+function computeQuote(input, bands) {
+  const lines = [];
+  let annualUsagePre = 0;
+
+  (input.selected || []).forEach((key) => {
+    const p = CATALOG[key];
+    if (!p) return;
+    const row = input.products[key] || {};
+    const vol = Number(row.volume) || 0;
+    if (vol <= 0) return;
+    const basis = row.basis || "monthly";
+    const disc = frac(row.discountPct);
+    const monthlyVol = toMonthly(vol, basis);
+    const { cost: monthlyCostPre, breakdown } = gradedCost(monthlyVol, p.tiers);
+    const monthlyCostNet = monthlyCostPre * (1 - disc);
+    const annualPre = monthlyCostPre * 12;
+    const annualNet = monthlyCostNet * 12;
+    const annualVol = basis === "annual" ? vol : vol * 12;
+    annualUsagePre += annualPre;
+    lines.push({
+      key: p.key, name: p.name, unit: p.unit, basis, enteredVol: vol, annualVol,
+      discountPct: disc, monthlyCostPre, monthlyCostNet, annualPre, annualNet,
+      effRatePre: monthlyVol > 0 ? monthlyCostPre / monthlyVol : 0,
+      effRateNet: monthlyVol > 0 ? monthlyCostNet / monthlyVol : 0,
+      tierRows: breakdown.map((b) => ({ ...b, netRate: b.rate * (1 - disc), tierTotal: b.units * b.rate * (1 - disc) })),
+    });
+  });
+
+  const hasDeal = lines.length > 0;
+  const tier = implTier(annualUsagePre);
+  const implDisc = frac(input.implDiscountPct);
+  const implPre = hasDeal ? tier.fee : 0;
+  const implNet = implPre * (1 - implDisc);
+  const implLine = hasDeal ? { name: "Implementation", tierLabel: tier.label, pre: implPre, discountPct: implDisc, net: implNet } : null;
+
+  const usageNet = lines.reduce((a, l) => a + l.annualNet, 0);
+  const totalPre = annualUsagePre + implPre;
+  const totalNet = usageNet + implNet;
+  const totalDiscountAmt = totalPre - totalNet;
+  const blendedDiscount = totalPre > 0 ? totalDiscountAmt / totalPre : 0;
+
+  let approval, approver, routingReason;
+  if (blendedDiscount >= bands.financeAbove) {
+    approval = "FINANCE"; approver = "Finance approval"; routingReason = `Blended discount ${pct(blendedDiscount)} at or above ${pct(bands.financeAbove)}`;
+  } else if (blendedDiscount >= bands.managerAbove) {
+    approval = "MANAGER"; approver = "Manager approval"; routingReason = `Blended discount ${pct(blendedDiscount)} at or above ${pct(bands.managerAbove)}`;
+  } else {
+    approval = "AUTO"; approver = "No approval needed"; routingReason = `Blended discount ${pct(blendedDiscount)} under ${pct(bands.managerAbove)}`;
+  }
+
+  return { lines, implLine, hasDeal, annualUsagePre, usageNet, totalPre, totalNet, totalDiscountAmt, blendedDiscount, approval, approver, routingReason, implTier: tier };
+}
+
+function pct(x) { return `${(x * 100).toFixed((x * 100) % 1 === 0 ? 0 : 1)}%`; }
+function money(x) { return x.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }); }
+function rate(x) { return `$${(+x.toFixed(4)).toString()}`; }
+function num(x) { return Math.round(x).toLocaleString("en-US"); }
+function unitOf(u) { return u.replace(/s$/, ""); }
+
+/* ============================================================================
+   SAMPLES
+   ========================================================================== */
+function mkInput(account, aeName, products, implDiscountPct) {
+  const base = blankInput();
+  Object.keys(products).forEach((k) => { base.products[k] = { volume: products[k].v, basis: products[k].b || "monthly", discountPct: products[k].d ?? "" }; });
+  base.selected = USAGE_PRODUCTS.map((p) => p.key).filter((k) => k in products);
+  base.account = account; base.aeName = aeName; base.implDiscountPct = implDiscountPct ?? "";
+  return base;
+}
+const SAMPLES = [
+  { label: "Sample 1 - Auto Approve", input: mkInput("Northgate Neobank", "A. Rivera", { email_enrichment: { v: 30000, d: 5 }, phone_enrichment: { v: 30000, d: 5 }, device_intel: { v: 500000, d: 5 } }, 5) },
+  { label: "Sample 2 - Manager Approval", input: mkInput("Coastal Payments", "A. Rivera", { email_enrichment: { v: 60000, d: 15 }, device_intel: { v: 1500000, d: 15 } }, 15) },
+  { label: "Sample 3 - Finance Approval", input: mkInput("Velocity Lending", "J. Park", { email_enrichment: { v: 150000, d: 25 }, phone_enrichment: { v: 150000, d: 25 }, device_intel: { v: 5000000, d: 25 } }, 25) },
+  { label: "Sample 4 - Annual Usage", input: mkInput("Meridian Bank", "J. Park", { email_enrichment: { v: 600000, b: "annual" }, device_intel: { v: 12000000, b: "annual" } }) },
+];
+
+const NOTES_EXAMPLE = `Prospect (Northgate Neobank, AE A. Rivera) expects about 30k users onboarded per month, wants both email and phone enrichment, plus roughly 500k device intelligence API calls a month. We're thinking ~10% off to close.`;
+
+function blankInput() {
+  const products = {};
+  USAGE_PRODUCTS.forEach((p) => { products[p.key] = { volume: "", basis: "monthly", discountPct: "" }; });
+  return { account: "", aeName: "", products, implDiscountPct: "", selected: [] };
+}
+
+/* ============================================================================
+   AI EDGES (optional — behind an in-page key; the quote works fully without it)
+   ========================================================================== */
+let ANTHROPIC_KEY = (() => { try { return localStorage.getItem("sardine_cpq_key") || ""; } catch (e) { return ""; } })();
+async function callClaude(messages, system) {
+  const GW = (window.SARDINE_CPQ_CONFIG && window.SARDINE_CPQ_CONFIG.GATEWAY) || {};
+  if (GW.url) {
+    const gres = await fetch(GW.url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Gateway-Token": GW.token || "" },
+      body: JSON.stringify({ project: GW.project || "sardine-cpq", model: RUNTIME_MODEL, max_tokens: 1200, system, messages }),
+    });
+    if (!gres.ok) throw new Error("Gateway error " + gres.status);
+    const gdata = await gres.json();
+    return gdata.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  }
+  if (!ANTHROPIC_KEY) throw new Error("Add an Anthropic API key at the top, or set a GATEWAY url in config.js. The CPQ engine works without either.");
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({ model: RUNTIME_MODEL, max_tokens: 1200, system, messages }),
+  });
+  if (!res.ok) throw new Error("Anthropic API error " + res.status);
+  const data = await res.json();
+  return data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+}
+
+async function parseQuoteNotes(raw) {
+  const keys = USAGE_PRODUCTS.map((p) => p.key).join(", ");
+  const system =
+    "Extract structured CPQ inputs from messy sales notes for a fraud/identity platform. " +
+    "Respond with ONLY a JSON object, no prose, no fences. Keys: account (string), aeName (string), " +
+    `products (object keyed by: ${keys}; each {volume:number, basis:"monthly"|"annual", discountPct:number}), ` +
+    "implDiscountPct (number). " +
+    "Map email enrichment->email_enrichment, phone enrichment->phone_enrichment, device intelligence/device intel/API calls->device_intel. " +
+    "Only include a product key if a volume is stated. basis is 'monthly' unless the note clearly says per year/annual. If a blanket discount is mentioned, set it on every product that has a volume. Never invent numbers; omit or 0 when absent.";
+  return JSON.parse((await callClaude([{ role: "user", content: raw }], system)).replace(/```json|```/g, "").trim());
+}
+
+// Long-format export: one row per product line (plus an implementation row) per
+// quote, each carrying line detail AND the quote-level totals. Built for pivots.
+function downloadCSV(rows) {
+  const esc = (v) => `"${String(v).replace(/"/g, '""')}"`;
+  const r4 = (x) => Math.round(x * 10000) / 10000;
+  const header = [
+    "Quote #", "Timestamp", "AE", "Account",
+    "Line type", "Product", "Volume entered", "Volume period", "Annual volume", "Unit",
+    "Default annual price", "Line discount (frac)", "Discounted annual price", "Effective unit rate",
+    "Base ARR (pre-disc)", "Total discount", "Overall blended discount (frac)", "Final ARR", "Implementation revenue", "Year-one revenue", "Routing", "Status",
+  ];
+  const out = [header.map(esc).join(",")];
+  rows.forEach((r) => {
+    const ctx = [Math.round(r.annualUsagePre), Math.round(r.totalDiscountAmt), r4(r.blendedDiscount), Math.round(r.usageNet), Math.round(r.implNet), Math.round(r.totalNet), r.approver, r.status];
+    (r.lines || []).forEach((l) => {
+      out.push([r.quoteNo, r.ts, r.ae, r.account, "Product", l.name, l.enteredVol, l.basis, Math.round(l.annualVol), l.unit, Math.round(l.annualPre), r4(l.discountPct), Math.round(l.annualNet), r4(l.effRateNet), ...ctx].map(esc).join(","));
+    });
+    if (r.impl) {
+      out.push([r.quoteNo, r.ts, r.ae, r.account, "Implementation", "Implementation (" + r.impl.tierLabel + ")", "", "one-time", "", "", Math.round(r.impl.pre), r4(r.impl.discountPct), Math.round(r.impl.net), "", ...ctx].map(esc).join(","));
+    }
+  });
+  const blob = new Blob([out.join("\n")], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = "sardine_cpq_quotes.csv"; a.click(); URL.revokeObjectURL(url);
+}
+
+const STYLES = `
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Hanken+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+.dd-root{--paper:#F4F1EA;--card:#FBF9F4;--ink:#16202E;--ink-soft:#5B6573;--line:#DFD8CA;--line-strong:#C9C0AE;
+--approve:#1F6F54;--approve-bg:#E6F0E9;--approve-line:#BBD6C6;--route:#9E6A0E;--route-bg:#F7ECD6;--route-line:#E6CF9F;--reject:#A33A2A;--reject-bg:#F3E0DA;--reject-line:#E2BBAE;
+background:var(--paper);color:var(--ink);font-family:'Hanken Grotesk',sans-serif;padding:28px;min-height:100%;line-height:1.5;}
+.dd-root *{box-sizing:border-box;}
+.dd-mono{font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums;}
+.dd-head h1{font-family:'Fraunces',serif;font-weight:600;font-size:30px;margin:0;letter-spacing:-0.01em;}
+.dd-head p{margin:4px 0 0;color:var(--ink-soft);font-size:14px;}
+.dd-tag{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:0.04em;color:var(--ink-soft);border:1px solid var(--line-strong);border-radius:999px;padding:3px 10px;margin-top:10px;background:var(--card);}
+.dd-rules{border:1px solid var(--line);background:var(--card);border-radius:12px;padding:16px 18px;margin-top:18px;}
+.dd-rules .rh{display:flex;align-items:center;justify-content:space-between;cursor:pointer;}
+.dd-rules h3{font-family:'Fraunces',serif;font-weight:600;font-size:15px;margin:0;}
+.dd-rules .toggle{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-soft);}
+.dd-rulegrid{display:flex;flex-wrap:wrap;gap:14px 20px;margin-top:14px;}
+.dd-rulegrid label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:0.03em;color:var(--ink-soft);margin-bottom:4px;}
+.dd-rulegrid .ri{display:flex;align-items:center;gap:5px;}
+.dd-num{width:64px;border:1px solid var(--line-strong);background:#fff;border-radius:6px;padding:6px 8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--ink);outline:none;}
+.dd-num:focus{border-color:var(--ink);}
+.dd-suffix{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--ink-soft);}
+.dd-logic{margin-top:14px;padding:12px 14px;border:1px dashed var(--line-strong);border-radius:8px;font-size:12.5px;color:var(--ink-soft);line-height:1.6;}
+.dd-sub{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:0.05em;text-transform:uppercase;color:var(--ink);font-weight:600;margin:14px 0 8px;}
+.dd-logic b{color:var(--ink);}
+.dd-card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-top:20px;}
+.dd-card h2{font-family:'Fraunces',serif;font-weight:600;font-size:17px;margin:0 0 14px;}
+.dd-card h2 .sub{font-family:'Hanken Grotesk';font-size:12px;font-weight:400;color:var(--ink-soft);}
+.dd-label{display:block;font-size:12px;font-weight:600;color:var(--ink-soft);letter-spacing:0.03em;text-transform:uppercase;margin-bottom:5px;}
+.dd-input,.dd-select,.dd-area{width:100%;border:1px solid var(--line-strong);background:#fff;border-radius:8px;padding:9px 11px;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--ink);outline:none;transition:border-color .15s;}
+.dd-input:focus,.dd-select:focus,.dd-area:focus{border-color:var(--ink);}
+.dd-area{font-family:'Hanken Grotesk',sans-serif;resize:vertical;min-height:70px;line-height:1.45;}
+.dd-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:13px;}
+.dd-field{margin-bottom:13px;}
+.dd-btn{font-family:'Hanken Grotesk',sans-serif;font-weight:600;font-size:13px;border-radius:8px;padding:10px 16px;cursor:pointer;border:1px solid var(--ink);background:var(--ink);color:var(--paper);transition:opacity .15s,transform .05s;}
+.dd-btn:hover{opacity:.88;}.dd-btn:active{transform:translateY(1px);}.dd-btn:disabled{opacity:.4;cursor:default;}
+.dd-btn-ghost{background:transparent;color:var(--ink);border:1px solid var(--line-strong);}
+.dd-btn-sm{padding:4px 10px;font-size:11px;}
+.dd-btn-send{border-color:var(--route);background:var(--route);}
+.dd-chiprow{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:14px;}
+.dd-chip{font-family:'JetBrains Mono',monospace;font-size:11px;padding:5px 10px;border:1px dashed var(--line-strong);border-radius:7px;background:#fff;cursor:pointer;color:var(--ink-soft);}
+.dd-chip:hover{border-color:var(--ink);color:var(--ink);}
+.dd-grid-tbl{width:100%;border-collapse:collapse;margin-top:4px;}
+.dd-grid-tbl th{font-size:10px;text-transform:uppercase;letter-spacing:0.03em;color:var(--ink-soft);text-align:left;padding:6px 8px;font-weight:600;border-bottom:1px solid var(--line-strong);}
+.dd-grid-tbl th.r,.dd-grid-tbl td.r{text-align:right;}
+.dd-grid-tbl td{padding:7px 8px;vertical-align:middle;border-bottom:1px solid var(--line);}
+.dd-grid-tbl tr.impl td{background:rgba(0,0,0,0.015);}
+.dd-grid-tbl tr.total td{border-top:2px solid var(--line-strong);font-weight:600;padding-top:9px;}
+.dd-grid-tbl .nm{font-size:13px;display:flex;align-items:center;gap:6px;}
+.dd-grid-tbl .mono{font-family:'JetBrains Mono',monospace;font-size:12.5px;font-variant-numeric:tabular-nums;}
+.dd-grid-tbl .soft{color:var(--ink-soft);}
+.dd-cell{width:100%;border:1px solid var(--line-strong);background:#fff;border-radius:6px;padding:6px 7px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--ink);outline:none;}
+.dd-cell.disc{flex:1;min-width:0;}
+.dd-cell:focus{border-color:var(--ink);}
+.dd-cellsel{width:100%;border:1px solid var(--line-strong);background:#fff;border-radius:6px;padding:6px 6px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--ink);outline:none;}
+.dd-discwrap{display:flex;align-items:center;gap:4px;}
+.dd-help{font-size:12px;color:var(--ink-soft);margin-top:10px;line-height:1.55;}
+.dd-info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;border:1px solid var(--line-strong);color:var(--ink-soft);font-size:10px;font-style:normal;font-family:'JetBrains Mono',monospace;cursor:help;position:relative;}
+.dd-info:hover{border-color:var(--ink);color:var(--ink);}
+.dd-tip{display:none;position:absolute;z-index:40;top:22px;left:0;width:360px;background:#fff;border:1px solid var(--line-strong);border-radius:10px;box-shadow:0 10px 30px rgba(22,32,46,.16);padding:13px;cursor:default;}
+.dd-info:hover .dd-tip{display:block;}
+.dd-tip h5{margin:0 0 9px;font-family:'Fraunces',serif;font-size:13px;font-weight:600;}
+.dd-tiptbl{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:10.5px;font-variant-numeric:tabular-nums;}
+.dd-tiptbl th{text-align:right;color:var(--ink-soft);font-weight:600;padding:3px 5px;border-bottom:1px solid var(--line);text-transform:none;letter-spacing:0;}
+.dd-tiptbl th:first-child,.dd-tiptbl td:first-child{text-align:left;}
+.dd-tiptbl td{text-align:right;padding:3px 5px;}
+.dd-tiptbl tr.sum td{border-top:1px solid var(--line-strong);font-weight:600;}
+.dd-tipnote{font-family:'Hanken Grotesk',sans-serif;font-size:11px;color:var(--ink-soft);margin-top:8px;}
+.dd-est{border:1px solid var(--line-strong);border-radius:12px;padding:16px;background:#fff;}
+.dd-est .e-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 16px;}
+@media (max-width:760px){.dd-est .e-grid{grid-template-columns:1fr 1fr;}}
+.dd-est .e-k{font-size:11px;text-transform:uppercase;letter-spacing:0.03em;color:var(--ink-soft);}
+.dd-est .e-v{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:600;letter-spacing:-0.01em;}
+.dd-est .e-note{font-size:11px;color:var(--ink-soft);margin-top:12px;}
+.dd-predict{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;padding:11px 14px;border-radius:10px;border:1px solid;}
+.dd-predict .p-label{font-size:11px;text-transform:uppercase;letter-spacing:0.04em;font-weight:600;}
+.dd-predict .p-val{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;text-align:right;}
+.v-AUTO{background:var(--approve-bg);border-color:var(--approve-line);color:var(--approve);}
+.v-MANAGER{background:var(--route-bg);border-color:var(--route-line);color:var(--route);}
+.v-FINANCE{background:var(--reject-bg);border-color:var(--reject-line);color:var(--reject);}
+.dd-verdict{border-radius:12px;padding:16px 18px;margin-bottom:16px;border:1px solid;}
+.dd-verdict .v-top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+.dd-verdict .v-decision{font-family:'Fraunces',serif;font-weight:600;font-size:24px;letter-spacing:-0.01em;}
+.dd-verdict .v-route{font-family:'JetBrains Mono',monospace;font-size:12px;padding:4px 10px;border-radius:999px;background:#fff;border:1px solid;}
+.dd-twocol{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;}
+@media (max-width:760px){.dd-twocol{grid-template-columns:1fr;}}
+.dd-ai{border:1px solid var(--line);border-radius:12px;overflow:hidden;}
+.dd-ai .ai-head{background:var(--card);padding:9px 14px;border-bottom:1px solid var(--line);font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;color:var(--ink-soft);}
+.dd-ai .ai-body{padding:14px;font-size:14px;line-height:1.55;}
+.dd-ts{margin-top:14px;border:1px solid var(--approve-line);border-radius:12px;overflow:hidden;}
+.dd-ts .ts-head{display:flex;align-items:center;justify-content:space-between;background:var(--approve-bg);padding:9px 14px;border-bottom:1px solid var(--approve-line);}
+.dd-ts .ts-head span{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:0.04em;text-transform:uppercase;color:var(--approve);}
+.dd-ts pre{margin:0;padding:14px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;color:var(--ink);}
+.dd-empty{color:var(--ink-soft);font-size:14px;text-align:center;padding:24px 16px;}
+.dd-err{color:var(--reject);font-size:12.5px;margin-top:8px;font-family:'JetBrains Mono',monospace;}
+.dd-fade{animation:ddfade .4s ease both;}@keyframes ddfade{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
+.dd-filters{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:12px;}
+.dd-logtable{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:12px;}
+.dd-logtable th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.03em;color:var(--ink-soft);padding:7px 9px;border-bottom:1px solid var(--line-strong);}
+.dd-logtable td{padding:7px 9px;border-bottom:1px solid var(--line);}
+.dd-pill{font-size:10px;padding:2px 8px;border-radius:999px;border:1px solid;}
+.dd-keybar{border:1px solid var(--line);background:var(--card);border-radius:12px;padding:14px 18px;margin-top:14px;}
+.dd-picker{margin:4px 0 10px;}
+.dd-pickrow{display:flex;gap:10px;align-items:stretch;}
+.dd-pickinput{position:relative;flex:1;}
+.dd-pickmenu{position:absolute;z-index:40;top:calc(100% + 4px);left:0;right:0;background:#fff;border:1px solid var(--line-strong);border-radius:8px;box-shadow:0 10px 28px rgba(22,32,46,.14);max-height:240px;overflow:auto;padding:4px;}
+.dd-pickitem{display:flex;justify-content:space-between;gap:10px;padding:8px 10px;border-radius:6px;cursor:pointer;font-size:13px;}
+.dd-pickitem:hover{background:var(--card);}
+.dd-pickitem .soft{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-soft);}
+.dd-x{border:1px solid var(--line-strong);background:#fff;color:var(--ink-soft);border-radius:6px;width:24px;height:24px;cursor:pointer;font-size:15px;line-height:1;padding:0;}
+.dd-x:hover{border-color:var(--reject);color:var(--reject);}
+`;
+
+function TierTip({ line }) {
+  return (
+    <span className="dd-info">i
+      <span className="dd-tip">
+        <h5>{line.name} · tiered pricing</h5>
+        <table className="dd-tiptbl">
+          <thead><tr><th>Tier (vol/mo)</th><th>Volume</th><th>Rate</th><th>Disc</th><th>Net rate</th><th>Total/mo</th></tr></thead>
+          <tbody>
+            {line.tierRows.map((b, i) => (
+              <tr key={i}>
+                <td>{num(b.from)}–{b.to === Infinity ? "∞" : num(b.to)}</td>
+                <td>{num(b.units)}</td>
+                <td>{rate(b.rate)}</td>
+                <td>{pct(line.discountPct)}</td>
+                <td>{rate(b.netRate)}</td>
+                <td>{money(b.tierTotal)}</td>
+              </tr>
+            ))}
+            <tr className="sum"><td colSpan={5}>Monthly sum (after discount)</td><td>{money(line.monthlyCostNet)}</td></tr>
+            <tr className="sum"><td colSpan={5}>Annual spend (× 12)</td><td>{money(line.annualNet)}</td></tr>
+          </tbody>
+        </table>
+        <div className="dd-tipnote">{num(line.annualVol)} {line.unit}/yr · blended {rate(line.effRateNet)} per {unitOf(line.unit)}{line.discountPct > 0 ? ` (list ${rate(line.effRatePre)})` : ""}</div>
+      </span>
+    </span>
+  );
+}
+
+function DiscountTip({ q }) {
+  const rows = [
+    ...q.lines.map((l) => ({ name: l.name, pct: l.discountPct, amt: l.annualPre - l.annualNet })),
+    ...(q.implLine ? [{ name: "Implementation", pct: q.implLine.discountPct, amt: q.implLine.pre - q.implLine.net }] : []),
+  ].filter((r) => r.amt > 0);
+  return (
+    <span className="dd-info">i
+      <span className="dd-tip">
+        <h5>Discount breakdown</h5>
+        <table className="dd-tiptbl">
+          <thead><tr><th>Line</th><th>Discount</th><th>Amount</th></tr></thead>
+          <tbody>
+            {rows.length === 0 ? <tr><td colSpan={3} style={{ textAlign: "left" }}>No discounts applied</td></tr> : rows.map((r, i) => (
+              <tr key={i}><td>{r.name}</td><td>{pct(r.pct)}</td><td>{money(r.amt)}</td></tr>
+            ))}
+            <tr className="sum"><td colSpan={2}>Total discount</td><td>{money(q.totalDiscountAmt)}</td></tr>
+          </tbody>
+        </table>
+      </span>
+    </span>
+  );
+}
+
+function ImplTip({ impl, annualUsagePre }) {
+  return (
+    <span className="dd-info">i
+      <span className="dd-tip">
+        <h5>Implementation · auto-calculated</h5>
+        <table className="dd-tiptbl"><tbody>
+          <tr><td>Annual usage (pre-discount)</td><td>{money(annualUsagePre)}</td></tr>
+          <tr><td>Deal-size band</td><td>{impl.tierLabel}</td></tr>
+          <tr><td>Band fee</td><td>{money(impl.pre)}</td></tr>
+          <tr><td>Manual discount</td><td>{pct(impl.discountPct)}</td></tr>
+          <tr className="sum"><td>Net (one-time)</td><td>{money(impl.net)}</td></tr>
+        </tbody></table>
+        <div className="dd-tipnote">One-time fee. The band is set by total annual usage across the three products, before any discount.</div>
+      </span>
+    </span>
+  );
+}
+
+function ProductPicker({ catalog, selected, onAdd, onAddDefault }) {
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+  const avail = catalog.filter((p) => !selected.includes(p.key) && `${p.name} ${p.driver} ${p.unit}`.toLowerCase().includes(q.toLowerCase()));
+  return (
+    <div className="dd-picker">
+      <div className="dd-pickrow">
+        <div className="dd-pickinput">
+          <input className="dd-input" value={q} placeholder="Search products to add…" onChange={(e) => { setQ(e.target.value); setOpen(true); }} onFocus={() => setOpen(true)} onBlur={() => setTimeout(() => setOpen(false), 150)} />
+          {open && (
+            <div className="dd-pickmenu">
+              {avail.length === 0 ? (
+                <div className="dd-pickitem" style={{ color: "var(--ink-soft)", cursor: "default" }}>{catalog.length === selected.length ? "All products added" : "No matches"}</div>
+              ) : avail.map((p) => (
+                <div key={p.key} className="dd-pickitem" onMouseDown={() => { onAdd(p.key); setQ(""); setOpen(false); }}>
+                  <span>{p.name}</span><span className="soft">per {unitOf(p.unit)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <button className="dd-btn dd-btn-ghost" onClick={onAddDefault}>+ Default set</button>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [bands, setBands] = useState(APPROVAL_BANDS);
+  const [apiKey, setApiKey] = useState(ANTHROPIC_KEY);
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const [input, setInput] = useState(blankInput());
+  const [raw, setRaw] = useState("");
+  const [parsing, setParsing] = useState(false);
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState("");
+  const [log, setLog] = useState([]);
+  const [calcSig, setCalcSig] = useState("");
+  const [sent, setSent] = useState(null);   // {approver, ts} once routed
+  const [sentSig, setSentSig] = useState("");
+
+  const setField = (k, v) => setInput((s) => ({ ...s, [k]: v }));
+  const setProd = (key, field, v) => setInput((s) => ({ ...s, products: { ...s.products, [key]: { ...s.products[key], [field]: v } } }));
+  const setBand = (k, v) => setBands((b) => ({ ...b, [k]: v }));
+  const addProduct = (key) => setInput((s) => s.selected.includes(key) ? s : ({ ...s, selected: [...s.selected, key], products: { ...s.products, [key]: s.products[key] || { volume: "", basis: "monthly", discountPct: "" } } }));
+  const addDefault = () => setInput((s) => { const add = (DEFAULT_PRODUCTS || []).filter((k) => !s.selected.includes(k)); const products = { ...s.products }; add.forEach((k) => { if (!products[k]) products[k] = { volume: "", basis: "monthly", discountPct: "" }; }); return { ...s, selected: [...s.selected, ...add], products }; });
+  const removeProduct = (key) => setInput((s) => ({ ...s, selected: s.selected.filter((k) => k !== key), products: { ...s.products, [key]: { volume: "", basis: "monthly", discountPct: "" } } }));
+
+  const live = computeQuote(input, bands);
+  const lineByKey = Object.fromEntries(live.lines.map((l) => [l.key, l]));
+  const sig = JSON.stringify(input) + JSON.stringify(bands);
+  const isCalculated = result && sig === calcSig;
+  const isSent = sig === sentSig && sentSig !== "";
+
+  function loadSample(s) { setInput(s.input); setRaw(""); setResult(null); setSummary(""); setQuote(""); setErr(""); setCalcSig(""); setSent(null); setSentSig(""); }
+
+  async function handleParse() {
+    if (!raw.trim()) return;
+    setParsing(true); setErr("");
+    try {
+      const p = await parseQuoteNotes(raw);
+      const base = blankInput();
+      const products = { ...base.products };
+      if (p.products) USAGE_PRODUCTS.forEach((u) => {
+        const row = p.products[u.key];
+        if (row && Number(row.volume) > 0) products[u.key] = { volume: row.volume, basis: row.basis === "annual" ? "annual" : "monthly", discountPct: row.discountPct ?? "" };
+      });
+      const selected = USAGE_PRODUCTS.map((u) => u.key).filter((k) => Number(products[k].volume) > 0);
+      setInput({ account: p.account ?? "", aeName: p.aeName ?? "", products, implDiscountPct: p.implDiscountPct ?? "", selected });
+      setResult(null); setCalcSig(""); setSent(null); setSentSig("");
+    } catch (e) { setErr("Could not parse that input. Use the grid, or edit the text and retry."); }
+    setParsing(false);
+  }
+
+  function handleCalculate() {
+    if (!live.hasDeal) return;
+    setErr(""); setSent(null); setSentSig("");
+    setResult(computeQuote(input, bands));
+    setCalcSig(sig);
+  }
+
+  function handleSend() {
+    if (!isCalculated) return;
+    const now = new Date();
+    const ts = now.toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    const status = result.approval === "AUTO" ? "Recorded (no approval)" : `Sent to ${result.approver.replace(" approval", "")}`;
+    const quoteNo = log.length + 1;
+    const lines = result.lines.map((l) => ({ name: l.name, unit: l.unit, enteredVol: l.enteredVol, basis: l.basis, annualVol: l.annualVol, annualPre: l.annualPre, discountPct: l.discountPct, annualNet: l.annualNet, effRateNet: l.effRateNet }));
+    const impl = { tierLabel: result.implTier.label, pre: result.implLine.pre, discountPct: result.implLine.discountPct, net: result.implLine.net };
+    setLog((prev) => [{ quoteNo, ts, ae: input.aeName || "—", account: input.account || "—", annualUsagePre: result.annualUsagePre, totalDiscountAmt: result.totalDiscountAmt, blendedDiscount: result.blendedDiscount, usageNet: result.usageNet, implNet: result.implLine.net, totalNet: result.totalNet, approval: result.approval, approver: result.approver, status, lines, impl }, ...prev]);
+    setSent({ approver: result.approver, approval: result.approval, ts, status });
+    setSentSig(sig);
+  }
+
+  const sendLabel = !result ? "" : result.approval === "AUTO" ? "Record quote — no approval needed →" : result.approval === "MANAGER" ? "Send to Manager for approval →" : "Send to Finance for approval →";
+
+  return (
+    <div className="dd-root">
+      <style>{STYLES}</style>
+
+      <div className="dd-head">
+        <h1>Sardine CPQ</h1>
+      </div>
+
+      {!(window.SARDINE_CPQ_CONFIG.GATEWAY && window.SARDINE_CPQ_CONFIG.GATEWAY.url) && (
+      <div className="dd-keybar">
+        <label className="dd-label">Anthropic API key <span style={{ textTransform: "none", fontWeight: 400 }}>(optional, enables the AI steps: extract notes, written summary, customer quote)</span></label>
+        <input className="dd-input" type="password" value={apiKey} placeholder="sk-ant-..." onChange={(e) => { setApiKey(e.target.value); ANTHROPIC_KEY = e.target.value; try { localStorage.setItem("sardine_cpq_key", e.target.value); } catch (err) {} }} />
+        <div className="e-note" style={{ marginTop: 6 }}>Demo only. The key is saved in this browser (localStorage) so it stays loaded across reloads, and is sent directly to Anthropic. In production it lives server-side. The deterministic pricing engine works with no key.</div>
+      </div>
+      )}
+
+      {/* EDITABLE APPROVAL POLICY */}
+      <div className="dd-rules">
+        <div className="rh" onClick={() => setRulesOpen((o) => !o)}>
+          <h3>Approval Policy &amp; Pricing Logic</h3>
+          <span className="toggle">{rulesOpen ? "▲ hide" : "▼ edit & view logic"}</span>
+        </div>
+        {rulesOpen && (
+          <>
+            <div className="dd-sub" style={{ marginTop: 6 }}>Approval Policy</div>
+            <div className="dd-rulegrid">
+              <div className="fl"><label>Manager approval at blended discount ≥</label><div className="ri"><input className="dd-num" value={Math.round(bands.managerAbove * 100)} onChange={(e) => setBand("managerAbove", (Number(e.target.value) || 0) / 100)} /><span className="dd-suffix">%</span></div></div>
+              <div className="fl"><label>Finance approval at blended discount ≥</label><div className="ri"><input className="dd-num" value={Math.round(bands.financeAbove * 100)} onChange={(e) => setBand("financeAbove", (Number(e.target.value) || 0) / 100)} /><span className="dd-suffix">%</span></div></div>
+            </div>
+            <div className="dd-logic">
+              The deal routes on the <b>blended</b> discount across all lines: under {pct(bands.managerAbove)} self-serves, {pct(bands.managerAbove)}–{pct(bands.financeAbove)} needs manager sign-off, {pct(bands.financeAbove)}+ needs finance.
+            </div>
+
+            <div className="dd-sub">Pricing Logic</div>
+            <div className="dd-logic" style={{ marginTop: 0 }}>
+              <b>Suggested price</b> runs each product's <b>graduated tiers</b> (each monthly volume bracket billed at its own rate, like tax brackets), then annualizes (× 12). Each line then takes its own <b>manual discount</b>. <b>Implementation</b> is a one-time fee set by the annual usage band <b>before</b> discount: {IMPLEMENTATION_TIERS.map((t) => `${t.label} → ${money(t.fee)}`).join(", ")}. The full per-product tier rate card lives in config.js.
+            </div>
+
+            <div style={{ fontSize: 11, color: "var(--ink-soft)", marginTop: 14, fontStyle: "italic" }}>
+              Demo only: these thresholds and rates are surfaced here for transparency. In production they live in the config file and are edited there, with no code changes.
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* SECTION 1 — BUILD THE QUOTE */}
+      <div className="dd-card">
+        <h2>1 · Build the Quote</h2>
+        <div className="dd-chiprow">{SAMPLES.map((s) => <button key={s.label} className="dd-chip" onClick={() => loadSample(s)}>{s.label}</button>)}</div>
+
+        <div className="dd-field">
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 5 }}>
+            <label className="dd-label" style={{ marginBottom: 0 }}>Input Notes</label>
+            <button className="dd-btn dd-btn-ghost dd-btn-sm" onClick={() => setRaw(NOTES_EXAMPLE)}>Load Example</button>
+          </div>
+          <textarea className="dd-area" value={raw} onChange={(e) => setRaw(e.target.value)} placeholder="Paste a call note and let AI Extract fill the grid…" />
+          <div style={{ marginTop: 8 }}>
+            <button className="dd-btn" onClick={handleParse} disabled={parsing || !raw.trim()}>{parsing ? "Extracting…" : "AI Extract (Claude Haiku 4.5)"}</button>
+          </div>
+        </div>
+
+        <div style={{ height: 1, background: "var(--line)", margin: "16px 0" }} />
+
+        <div className="dd-row">
+          <div><label className="dd-label">Account</label><input className="dd-input" value={input.account} onChange={(e) => setField("account", e.target.value)} placeholder="Prospect name" /></div>
+          <div><label className="dd-label">AE Name</label><input className="dd-input" value={input.aeName} onChange={(e) => setField("aeName", e.target.value)} placeholder="AE" /></div>
+        </div>
+
+        <ProductPicker catalog={USAGE_PRODUCTS} selected={input.selected} onAdd={addProduct} onAddDefault={addDefault} />
+
+        {input.selected.length === 0 ? (
+          <div className="dd-empty" style={{ border: "1px dashed var(--line-strong)", borderRadius: 10 }}>
+            No products on this quote yet. Add the default set or search the catalog above to start building.
+          </div>
+        ) : (
+          <table className="dd-grid-tbl" style={{ tableLayout: "fixed" }}>
+            <colgroup>
+              <col />
+              <col style={{ width: 104 }} />
+              <col style={{ width: 118 }} />
+              <col style={{ width: 134 }} />
+              <col style={{ width: 122 }} />
+              <col style={{ width: 134 }} />
+              <col style={{ width: 44 }} />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Product</th><th>Volume</th><th>Volume period</th>
+                <th className="r">Default total price</th><th>Manual discount</th><th className="r">Discounted price</th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {input.selected.map((key) => {
+                const p = CATALOG[key];
+                if (!p) return null;
+                const row = input.products[key];
+                const l = lineByKey[key];
+                return (
+                  <tr key={key}>
+                    <td><span className="nm">{p.name}{l && <TierTip line={l} />}</span></td>
+                    <td><input className="dd-cell" value={row.volume} onChange={(e) => setProd(key, "volume", e.target.value)} placeholder="0" /></td>
+                    <td>
+                      <select className="dd-cellsel" value={row.basis} onChange={(e) => setProd(key, "basis", e.target.value)}>
+                        <option value="monthly">Monthly</option><option value="annual">Annual</option>
+                      </select>
+                    </td>
+                    <td className="r mono soft">{l ? money(l.annualPre) : "—"}</td>
+                    <td><span className="dd-discwrap"><input className="dd-cell disc" value={row.discountPct} onChange={(e) => setProd(key, "discountPct", e.target.value)} placeholder="0" /><span className="soft">%</span></span></td>
+                    <td className="r mono">{l ? money(l.annualNet) : "—"}</td>
+                    <td className="r"><button className="dd-x" title="Remove product" onClick={() => removeProduct(key)}>×</button></td>
+                  </tr>
+                );
+              })}
+              {live.implLine && (
+                <tr className="impl">
+                  <td><span className="nm">Implementation <span className="soft" style={{ fontSize: 11 }}>(auto · {live.implTier.label})</span><ImplTip impl={live.implLine} annualUsagePre={live.annualUsagePre} /></span></td>
+                  <td className="soft">—</td>
+                  <td className="soft" style={{ fontSize: 11 }}>one-time</td>
+                  <td className="r mono soft">{money(live.implLine.pre)}</td>
+                  <td><span className="dd-discwrap"><input className="dd-cell disc" value={input.implDiscountPct} onChange={(e) => setField("implDiscountPct", e.target.value)} placeholder="0" /><span className="soft">%</span></span></td>
+                  <td className="r mono">{money(live.implLine.net)}</td>
+                  <td></td>
+                </tr>
+              )}
+              {live.hasDeal && (
+                <tr className="total">
+                  <td className="nm">Total</td>
+                  <td></td>
+                  <td></td>
+                  <td className="r mono soft">{money(live.totalPre)}</td>
+                  <td className="mono" style={{ paddingLeft: 9 }}>{pct(live.blendedDiscount)}</td>
+                  <td className="r mono">{money(live.totalNet)}</td>
+                  <td></td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        )}
+        <div className="dd-help">
+          Email and Phone Enrichment are priced per <b>enrichment</b>; Device Intelligence per <b>API call</b>. Add products from the dropdown, type a volume, and hover the <span className="dd-info" style={{ width: 14, height: 14 }}>i</span> on any line for its full tiered calculation. The catalog is config-driven, so this scales from 3 products to 50+ without code changes.
+        </div>
+      </div>
+
+      {/* SECTION 2 — PRICING SUMMARY & ROUTING */}
+      <div className="dd-card">
+        <h2>2 · Pricing Summary &amp; Routing</h2>
+        <div className="dd-est">
+          {!live.hasDeal ? (
+            <div className="dd-empty">Enter a volume above to see suggested pricing and routing.</div>
+          ) : (
+            <>
+              <div className="e-grid">
+                <div><div className="e-k">Base ARR <span style={{ textTransform: "none" }}>(pre-discount)</span></div><div className="e-v">{money(live.annualUsagePre)}</div></div>
+                <div><div className="e-k">Total discount <DiscountTip q={live} /></div><div className="e-v" style={{ color: live.totalDiscountAmt > 0 ? "var(--route)" : "var(--ink)" }}>{live.totalDiscountAmt > 0 ? `−${money(live.totalDiscountAmt)}` : "—"}</div></div>
+                <div><div className="e-k">Overall blended discount</div><div className="e-v" style={{ color: live.blendedDiscount >= bands.financeAbove ? "var(--reject)" : live.blendedDiscount >= bands.managerAbove ? "var(--route)" : "var(--ink)" }}>{pct(live.blendedDiscount)}</div></div>
+                <div><div className="e-k">Final ARR <span style={{ textTransform: "none" }}>(post-discount)</span></div><div className="e-v">{money(live.usageNet)}</div></div>
+                <div><div className="e-k">Implementation revenue</div><div className="e-v">{money(live.implLine.net)}</div></div>
+                <div><div className="e-k">Year-one revenue</div><div className="e-v">{money(live.totalNet)}</div></div>
+              </div>
+              <div className="e-note">Suggested price runs the graduated tiers; routing keys off the blended discount. Nothing is logged until you send.</div>
+              <div className={`dd-predict v-${live.approval}`}>
+                <span className="p-label">Routing at {pct(live.blendedDiscount)} blended discount</span>
+                <span className="p-val">{live.approver}</span>
+              </div>
+            </>
+          )}
+        </div>
+
+        <button className="dd-btn" style={{ width: "100%", marginTop: 14 }} onClick={handleCalculate} disabled={!live.hasDeal || isCalculated}>{!live.hasDeal ? "Enter a volume to start" : isCalculated ? "Generated ✓ — edit the quote to update" : "Generate pricing summary →"}</button>
+        {err && <div className="dd-err">{err}</div>}
+
+      </div>
+
+      {/* SECTION 3 — GENERATED PRICING SUMMARY (deterministic; AI optional) */}
+      {isCalculated && (
+        <div className="dd-card dd-fade">
+          <h2>3 · Pricing Summary</h2>
+          <div className={`dd-verdict v-${result.approval}`}>
+            <div className="v-top">
+              <span className="v-decision">{result.approval === "AUTO" ? "No approval needed" : result.approval === "MANAGER" ? "Manager approval" : "Finance approval"}</span>
+              <span className={`v-route v-${result.approval}`}>{pct(result.blendedDiscount)} blended discount · {money(result.totalNet)} year one</span>
+            </div>
+          </div>
+
+          <table className="dd-grid-tbl">
+            <thead><tr><th>Product</th><th className="r">Annual volume</th><th className="r">Default total price</th><th className="r">Manual discount</th><th className="r">Discounted price</th></tr></thead>
+            <tbody>
+              {result.lines.map((l) => (
+                <tr key={l.key}>
+                  <td className="nm">{l.name}{<TierTip line={l} />}</td>
+                  <td className="r mono soft">{num(l.annualVol)} {l.unit}</td>
+                  <td className="r mono soft">{money(l.annualPre)}</td>
+                  <td className="r mono">{l.discountPct > 0 ? pct(l.discountPct) : "—"}</td>
+                  <td className="r mono">{money(l.annualNet)}</td>
+                </tr>
+              ))}
+              <tr className="impl">
+                <td className="nm">Implementation <span className="soft" style={{ fontSize: 11 }}>({result.implTier.label}, one-time)</span></td>
+                <td className="r mono soft">—</td>
+                <td className="r mono soft">{money(result.implLine.pre)}</td>
+                <td className="r mono">{result.implLine.discountPct > 0 ? pct(result.implLine.discountPct) : "—"}</td>
+                <td className="r mono">{money(result.implLine.net)}</td>
+              </tr>
+              <tr className="total">
+                <td className="nm">Total</td>
+                <td></td>
+                <td className="r mono soft">{money(result.totalPre)}</td>
+                <td className="r mono">{pct(result.blendedDiscount)}</td>
+                <td className="r mono">{money(result.totalNet)}</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div className="dd-est" style={{ marginTop: 14 }}>
+            <div className="e-grid">
+              <div><div className="e-k">Base ARR <span style={{ textTransform: "none" }}>(pre-discount)</span></div><div className="e-v">{money(result.annualUsagePre)}</div></div>
+              <div><div className="e-k">Total discount <DiscountTip q={result} /></div><div className="e-v" style={{ color: result.totalDiscountAmt > 0 ? "var(--route)" : "var(--ink)" }}>{result.totalDiscountAmt > 0 ? `−${money(result.totalDiscountAmt)}` : "—"}</div></div>
+              <div><div className="e-k">Overall blended discount</div><div className="e-v" style={{ color: result.blendedDiscount >= bands.financeAbove ? "var(--reject)" : result.blendedDiscount >= bands.managerAbove ? "var(--route)" : "var(--ink)" }}>{pct(result.blendedDiscount)}</div></div>
+              <div><div className="e-k">Final ARR <span style={{ textTransform: "none" }}>(post-discount)</span></div><div className="e-v">{money(result.usageNet)}</div></div>
+              <div><div className="e-k">Implementation revenue</div><div className="e-v">{money(result.implLine.net)}</div></div>
+              <div><div className="e-k">Year-one revenue</div><div className="e-v">{money(result.totalNet)}</div></div>
+            </div>
+            <div className="e-note">Routing: <b style={{ color: "var(--ink)" }}>{result.routingReason}</b> → {result.approver}. Bands: under {pct(bands.managerAbove)} self-serves, {pct(bands.managerAbove)}–{pct(bands.financeAbove)} manager, {pct(bands.financeAbove)}+ finance.</div>
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            {isSent && sent ? (
+              <div className={`dd-predict v-${sent.approval}`}>
+                <span className="p-label">{sent.approval === "AUTO" ? "Recorded" : "Routed"}</span>
+                <span className="p-val">{sent.status} · {sent.ts}</span>
+              </div>
+            ) : (
+              <button className="dd-btn dd-btn-send" onClick={handleSend}>{sendLabel}</button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* SECTION 4 — QUOTE LOG */}
+      {log.length > 0 && (
+        <div className="dd-card">
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+            <h2 style={{ margin: 0 }}>4 · Quote Log</h2>
+            <button className="dd-btn dd-btn-ghost" onClick={() => downloadCSV(log)}>Download detailed CSV ({log.length} {log.length === 1 ? "quote" : "quotes"})</button>
+          </div>
+          <table className="dd-logtable">
+            <thead><tr><th>Timestamp</th><th>AE</th><th>Account</th><th>Base ARR</th><th>Blended disc.</th><th>Final ARR</th><th>Impl. rev.</th><th>Year-1 rev.</th><th>Routing</th><th>Status</th></tr></thead>
+            <tbody>
+              {log.map((r, i) => (
+                <tr key={i}>
+                  <td style={{ color: "var(--ink-soft)" }}>{r.ts}</td><td>{r.ae}</td><td>{r.account}</td><td>{money(r.annualUsagePre)}</td><td>{pct(r.blendedDiscount)}</td><td>{money(r.usageNet)}</td><td>{money(r.implNet)}</td><td>{money(r.totalNet)}</td>
+                  <td><span className={`dd-pill v-${r.approval}`}>{r.approver}</span></td><td style={{ color: "var(--ink-soft)" }}>{r.status}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p style={{ color: "var(--ink-soft)", fontSize: 12, marginTop: 10, marginBottom: 0 }}>Captures every quote and its routing. In production this writes to Salesforce as the system of record (see write-up).</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
